@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,6 +14,7 @@ import (
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/fs"
+	"github.com/restic/restic/internal/progress/termstatus"
 	"github.com/restic/restic/internal/restic"
 )
 
@@ -40,10 +39,6 @@ given as the arguments.
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if backupOptions.Stdin && backupOptions.FilesFrom == "-" {
 			return errors.Fatal("cannot use both `--stdin` and `--files-from -`")
-		}
-
-		if backupOptions.Stdin {
-			return readBackupFromStdin(backupOptions, globalOptions, args)
 		}
 
 		return runBackup(backupOptions, globalOptions, args)
@@ -90,127 +85,6 @@ func init() {
 	f.BoolVar(&backupOptions.WithAtime, "with-atime", false, "store the atime for all files and directories")
 }
 
-func newScanProgress(gopts GlobalOptions) *restic.Progress {
-	if gopts.Quiet {
-		return nil
-	}
-
-	p := restic.NewProgress()
-	p.OnUpdate = func(s restic.Stat, d time.Duration, ticker bool) {
-		if IsProcessBackground() {
-			return
-		}
-
-		PrintProgress("[%s] %d directories, %d files, %s", formatDuration(d), s.Dirs, s.Files, formatBytes(s.Bytes))
-	}
-
-	p.OnDone = func(s restic.Stat, d time.Duration, ticker bool) {
-		PrintProgress("scanned %d directories, %d files in %s\n", s.Dirs, s.Files, formatDuration(d))
-	}
-
-	return p
-}
-
-func newArchiveProgress(gopts GlobalOptions, todo restic.Stat) *restic.Progress {
-	if gopts.Quiet {
-		return nil
-	}
-
-	archiveProgress := restic.NewProgress()
-
-	var bps, eta uint64
-	itemsTodo := todo.Files + todo.Dirs
-
-	archiveProgress.OnUpdate = func(s restic.Stat, d time.Duration, ticker bool) {
-		if IsProcessBackground() {
-			return
-		}
-
-		sec := uint64(d / time.Second)
-		if todo.Bytes > 0 && sec > 0 && ticker {
-			bps = s.Bytes / sec
-			if s.Bytes >= todo.Bytes {
-				eta = 0
-			} else if bps > 0 {
-				eta = (todo.Bytes - s.Bytes) / bps
-			}
-		}
-
-		itemsDone := s.Files + s.Dirs
-
-		status1 := fmt.Sprintf("[%s] %s  %s / %s  %d / %d items  %d errors  ",
-			formatDuration(d),
-			formatPercent(s.Bytes, todo.Bytes),
-			formatBytes(s.Bytes), formatBytes(todo.Bytes),
-			itemsDone, itemsTodo,
-			s.Errors)
-		status2 := fmt.Sprintf("ETA %s ", formatSeconds(eta))
-
-		if w := stdoutTerminalWidth(); w > 0 {
-			maxlen := w - len(status2) - 1
-
-			if maxlen < 4 {
-				status1 = ""
-			} else if len(status1) > maxlen {
-				status1 = status1[:maxlen-4]
-				status1 += "... "
-			}
-		}
-
-		PrintProgress("%s%s", status1, status2)
-	}
-
-	archiveProgress.OnDone = func(s restic.Stat, d time.Duration, ticker bool) {
-		fmt.Printf("\nduration: %s\n", formatDuration(d))
-	}
-
-	return archiveProgress
-}
-
-func newArchiveStdinProgress(gopts GlobalOptions) *restic.Progress {
-	if gopts.Quiet {
-		return nil
-	}
-
-	archiveProgress := restic.NewProgress()
-
-	var bps uint64
-
-	archiveProgress.OnUpdate = func(s restic.Stat, d time.Duration, ticker bool) {
-		if IsProcessBackground() {
-			return
-		}
-
-		sec := uint64(d / time.Second)
-		if s.Bytes > 0 && sec > 0 && ticker {
-			bps = s.Bytes / sec
-		}
-
-		status1 := fmt.Sprintf("[%s] %s  %s/s", formatDuration(d),
-			formatBytes(s.Bytes),
-			formatBytes(bps))
-
-		if w := stdoutTerminalWidth(); w > 0 {
-			maxlen := w - len(status1)
-
-			if maxlen < 4 {
-				status1 = ""
-			} else if len(status1) > maxlen {
-				status1 = status1[:maxlen-4]
-				status1 += "... "
-			}
-		}
-
-		PrintProgress("%s", status1)
-	}
-
-	archiveProgress.OnDone = func(s restic.Stat, d time.Duration, ticker bool) {
-		fmt.Printf("\nduration: %s\n", formatDuration(d))
-	}
-
-	return archiveProgress
-}
-
 // filterExisting returns a slice of all existing items, or an error if no
 // items exist at all.
 func filterExisting(items []string) (result []string, err error) {
@@ -229,56 +103,6 @@ func filterExisting(items []string) (result []string, err error) {
 	}
 
 	return
-}
-
-func readBackupFromStdin(opts BackupOptions, gopts GlobalOptions, args []string) error {
-	if len(args) != 0 {
-		return errors.Fatal("when reading from stdin, no additional files can be specified")
-	}
-
-	fn := opts.StdinFilename
-
-	if fn == "" {
-		return errors.Fatal("filename for backup from stdin must not be empty")
-	}
-
-	if filepath.Base(fn) != fn || path.Base(fn) != fn {
-		return errors.Fatal("filename is invalid (may not contain a directory, slash or backslash)")
-	}
-
-	if gopts.password == "" {
-		return errors.Fatal("unable to read password from stdin when data is to be read from stdin, use --password-file or $RESTIC_PASSWORD")
-	}
-
-	repo, err := OpenRepository(gopts)
-	if err != nil {
-		return err
-	}
-
-	lock, err := lockRepo(repo)
-	defer unlockRepo(lock)
-	if err != nil {
-		return err
-	}
-
-	err = repo.LoadIndex(gopts.ctx)
-	if err != nil {
-		return err
-	}
-
-	r := &archiver.Reader{
-		Repository: repo,
-		Tags:       opts.Tags,
-		Hostname:   opts.Hostname,
-	}
-
-	_, id, err := r.Archive(gopts.ctx, fn, os.Stdin, newArchiveStdinProgress(gopts))
-	if err != nil {
-		return err
-	}
-
-	Verbosef("archived as %v\n", id.Str())
-	return nil
 }
 
 // readFromFile will read all lines from the given filename and write them to a
@@ -341,14 +165,7 @@ func runBackup(opts BackupOptions, gopts GlobalOptions, args []string) error {
 		return errors.Fatal("nothing to backup, please specify target files/dirs")
 	}
 
-	target := make([]string, 0, len(args))
-	for _, d := range args {
-		if a, err := filepath.Abs(d); err == nil {
-			d = a
-		}
-		target = append(target, d)
-	}
-
+	target := args
 	target, err = filterExisting(target)
 	if err != nil {
 		return err
@@ -440,8 +257,6 @@ func runBackup(opts BackupOptions, gopts GlobalOptions, args []string) error {
 		Verbosef("using parent snapshot %v\n", parentSnapshotID.Str())
 	}
 
-	Verbosef("scan %v\n", target)
-
 	selectFilter := func(item string, fi os.FileInfo) bool {
 		for _, reject := range rejectFuncs {
 			if reject(item, fi) {
@@ -449,24 +264,6 @@ func runBackup(opts BackupOptions, gopts GlobalOptions, args []string) error {
 			}
 		}
 		return true
-	}
-
-	var stat restic.Stat
-	if !gopts.Quiet {
-		stat, err = archiver.Scan(target, selectFilter, newScanProgress(gopts))
-		if err != nil {
-			return err
-		}
-	}
-
-	arch := archiver.New(repo)
-	arch.Excludes = opts.Excludes
-	arch.SelectFilter = selectFilter
-	arch.WithAccessTime = opts.WithAtime
-
-	arch.Warn = func(dir string, fi os.FileInfo, err error) {
-		// TODO: make ignoring errors configurable
-		Warnf("%s\rwarning for %s: %v\n", ClearLine(), dir, err)
 	}
 
 	timeStamp := time.Now()
@@ -477,12 +274,81 @@ func runBackup(opts BackupOptions, gopts GlobalOptions, args []string) error {
 		}
 	}
 
-	_, id, err := arch.Snapshot(gopts.ctx, newArchiveProgress(gopts, stat), target, opts.Tags, opts.Hostname, parentSnapshotID, timeStamp)
+	var targetFS fs.FS = fs.Local{}
+	if opts.Stdin {
+		targetFS = &fs.Reader{
+			ModTime:    timeStamp,
+			Name:       opts.StdinFilename,
+			Mode:       0644,
+			ReadCloser: os.Stdin,
+		}
+	}
+
+	term := termstatus.New(gopts.ctx, os.Stdout)
+	AddCleanupHandler(term.Finish)
+
+	arch := archiver.NewNewArchiver(repo, targetFS)
+	arch.Select = selectFilter
+	arch.WithAtime = opts.WithAtime
+
+	var stats archiver.ItemStats
+	var cur []string
+
+	arch.StartItem = func(item string) {
+		if strings.HasSuffix(item, "/") {
+			return
+		}
+		// Verbosef("  %v [start]\n", item)
+		if len(cur) > 3 {
+			cur = cur[1:4]
+		}
+		cur = append(cur, item)
+		term.SetStatus(append([]string{fmt.Sprintf("lines: %d", len(cur))}, cur...))
+	}
+
+	arch.CompleteItem = func(item string, previous, current *restic.Node, s archiver.ItemStats) {
+		// stats.Add(s)
+		// if item == "/" {
+		// 	return
+		// }
+
+		// if previous == nil {
+		// 	term.Printf("+ %v %v\n", item, s)
+		// 	return
+		// }
+
+		// if current != nil && previous.Equals(*current) {
+		// 	term.Printf("  %v\n", item)
+		// 	return
+		// }
+
+		// term.Printf("M %v %v\n", item, s)
+	}
+
+	if parentSnapshotID == nil {
+		parentSnapshotID = &restic.ID{}
+	}
+
+	snapshotOpts := archiver.Options{
+		Excludes:       opts.Excludes,
+		Tags:           opts.Tags,
+		Time:           timeStamp,
+		Hostname:       opts.Hostname,
+		ParentSnapshot: *parentSnapshotID,
+	}
+
+	_, id, err := arch.Snapshot(gopts.ctx, target, snapshotOpts)
 	if err != nil {
 		return err
 	}
 
+	err = term.Finish()
+	if err != nil {
+		Warnf("error: %v", err)
+	}
+
 	Verbosef("snapshot %s saved\n", id.Str())
+	Verbosef("added %v data and %v metadata\n", formatBytes(stats.DataSize), formatBytes(stats.TreeSize))
 
 	return nil
 }
